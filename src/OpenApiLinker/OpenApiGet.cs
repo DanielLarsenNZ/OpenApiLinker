@@ -65,7 +65,7 @@ namespace OpenApiLinker
 
                             var schemaRefUri = new Uri(refValue);
 
-                            // Get definition
+                            // Get the external definition
                             (string schemaName, JObject jsonSchema, JToken? schema) = await GetSchemaFromUri(jObjectCache, schemaRefUri);
 
                             if (schema is null)
@@ -74,61 +74,18 @@ namespace OpenApiLinker
                                 continue;
                             }
 
+                            RewriteRef(@ref, schemaName);
+                            RemoveConsts(schema);
 
-                            // Add definition to definitions if not already exists
+                            // Add definition to schemas if not already exists
                             if (schemas[schemaName] == null)
                             {
                                 _logger.LogInformation($"Adding schema {schemaName} to schemas");
-                                schemas.Add(new JProperty(schemaName, schemas));
+                                schemas.Add(new JProperty(schemaName, schema));
                             }
 
-                            RewriteRef(@ref, schemaName);
-
-                            // Get refs in that schema
-                            JObject? schemasJObject = schema as JObject;
-                            var subRefs = schemasJObject.Descendants().Where(d => d.Path.EndsWith("$ref"));
-
-                            foreach (var subRef in subRefs.Distinct())
-                            {
-                                _logger.LogTrace($"@subRef = {subRef}");
-
-                                if (!subRef.HasValues) continue;
-
-                                //TODO: Single value always?
-                                var subRefValues = subRef.Values<string>();
-                                foreach (var subRefValue in subRefValues)
-                                {
-                                    if (subRefValue is null) continue;
-
-                                    if (subRefValue.StartsWith("https://"))
-                                    {
-                                        //TODO Support nested refs?
-                                        throw new NotSupportedException();
-                                    }
-
-                                    _logger.LogTrace($"$ref: {subRefValue}");
-
-                                    // Get definition
-                                    string subRefDefinitionName = DefinitionNameFromFragment(subRefValue);
-                                    var subRefDefinition = jsonSchema["definitions"]?[subRefDefinitionName];
-
-                                    if (subRefDefinition is null)
-                                    {
-                                        AddInfoError(info, $"Definition {subRefDefinitionName} was not found in JSON Schema {schemaRefUri}.");
-                                        continue;
-                                    }
-
-                                    // Add definition to definitions if not already exists
-                                    if (schemas[subRefDefinitionName] == null)
-                                    {
-                                        _logger.LogInformation($"Adding schema {subRefDefinitionName} to schemas");
-                                        schemas.Add(new JProperty(subRefDefinitionName, subRefDefinition));
-                                    }
-
-                                    // Rewrite definition ref to component ref
-                                    RewriteRef(subRef, subRefDefinitionName);
-                                }
-                            }
+                            _logger.LogTrace($"{schemaName} referenced by {schemas[schemaName].Path}");
+                            LinkSchemaReferences(info, schemas, schemaRefUri, jsonSchema, schemas[schemaName], 1);
                         }
                     }
                 }
@@ -164,6 +121,78 @@ namespace OpenApiLinker
                 response.Headers.Add("Content-Type", "text/plain");
                 await response.WriteStringAsync(ex.Message);
                 return response;
+            }
+        }
+
+        private void LinkSchemaReferences(List<string> informationMessages, JObject openApiSchemas, Uri? schemaRefUri, JObject jsonSchemaDocument, JToken? currentReferencedSchema, int depth)
+        {
+            // Get refs in that schema
+            JObject? currentSchemaJObject = currentReferencedSchema as JObject;
+            if (currentSchemaJObject is null) throw new InvalidOperationException();
+            var refs = currentSchemaJObject.Descendants().Where(d => d.Path.EndsWith("$ref"));
+
+            foreach (var @ref in refs.Distinct())
+            {
+                _logger.LogTrace($"@ref = {@ref}");
+
+                if (!@ref.HasValues) continue;
+
+                var refValues = @ref.Values<string>();
+                foreach (var refValue in refValues)
+                {
+                    if (refValue is null) continue;
+
+                    if (refValue.StartsWith("https://"))
+                    {
+                        //TODO Support nested refs?
+                        throw new NotSupportedException();
+                    }
+
+                    _logger.LogTrace($"$ref: {refValue}");
+
+                    // Get definition
+                    string schemaName = SchemaNameFromFragment(refValue);
+
+                    // Rewrite definition ref to component ref
+                    RewriteRef(@ref, schemaName);
+
+                    _logger.LogTrace(PadForDepth($"{depth}: {schemaName} referenced by {currentSchemaJObject.Path}", depth));
+
+                    // if Schema has already been added to components/schemas then skip this and don't recurse.
+                    if (openApiSchemas[schemaName] != null) continue;
+
+                    var schemaDefinition = jsonSchemaDocument["definitions"]?[schemaName];
+
+                    if (schemaDefinition is null)
+                    {
+                        AddInfoError(informationMessages, $"Schema {schemaName} was not found in JSON Schema {schemaRefUri}.");
+                        continue;
+                    }
+
+                    RemoveConsts(schemaDefinition);
+
+                    _logger.LogInformation($"Adding schema {schemaName} to schemas");
+                    openApiSchemas.Add(new JProperty(schemaName, schemaDefinition));
+
+                    // Recursively link schemas
+                    LinkSchemaReferences(informationMessages, openApiSchemas, schemaRefUri, jsonSchemaDocument, openApiSchemas[schemaName], depth++);
+                }
+            }
+        }
+
+        private string PadForDepth(string message, int depth) => message.PadLeft(message.Length + depth);
+
+        private static void RemoveConsts(JToken? schemaDefinition)
+        {
+            // Remove const properties which are not supported in OpenAPI schema
+            var schemaDefinitionJObject = schemaDefinition as JObject;
+            while (schemaDefinitionJObject.SelectToken("properties.*.const") != null)
+            {
+                var properties = schemaDefinitionJObject.SelectTokens("properties.*");
+                foreach (JObject property in properties)
+                {
+                    property.Remove("const");
+                }
             }
         }
 
@@ -205,11 +234,11 @@ namespace OpenApiLinker
             //TODO: Check nulls
             JObject refJson = await GetJObjectFromUri(jObjectCache, uri);
             string definitionPath = uri.Fragment.Replace("#/", string.Empty);
-            string definitionName = DefinitionNameFromFragment(definitionPath);
+            string definitionName = SchemaNameFromFragment(definitionPath);
             return (definitionName, refJson, refJson["definitions"]?[definitionName]);
         }
 
-        private static string DefinitionNameFromFragment(string fragment) => fragment.Split("/").Last();
+        private static string SchemaNameFromFragment(string fragment) => fragment.Split("/").Last();
 
 
         private async Task<JObject> GetJObjectFromUri(Dictionary<string, JObject> jObjectCache, Uri uri)
