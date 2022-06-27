@@ -1,6 +1,6 @@
 # OpenAPI Linker
 
-An Azure Function for inlining external JSON references in OpenAPI JSON specs.
+An Azure Function for inlining external JSON Schema references in OpenAPI JSON specs.
 
 > 👷🏻‍♂️⛔👷🏻‍♀️ Work in progress!
 
